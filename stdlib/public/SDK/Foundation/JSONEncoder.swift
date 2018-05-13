@@ -87,7 +87,7 @@ open class JSONEncoder {
     public enum KeyEncodingStrategy {
         /// Use the keys specified by each type. This is the default strategy.
         case useDefaultKeys
-        
+
         /// Convert from "camelCaseKeys" to "snake_case_keys" before writing a key to JSON payload.
         ///
         /// Capital characters are determined by testing membership in `CharacterSet.uppercaseLetters` and `CharacterSet.lowercaseLetters` (Unicode General Categories Lu and Lt).
@@ -103,15 +103,15 @@ open class JSONEncoder {
         ///
         /// - Note: Using a key encoding strategy has a nominal performance cost, as each string key has to be converted.
         case convertToSnakeCase
-        
+
         /// Provide a custom conversion to the key in the encoded JSON from the keys specified by the encoded types.
         /// The full path to the current encoding position is provided for context (in case you need to locate this key within the payload). The returned key is used in place of the last component in the coding path before encoding.
         /// If the result of the conversion is a duplicate key, then only one value will be present in the result.
         case custom((_ codingPath: [CodingKey]) -> CodingKey)
-        
+
         fileprivate static func _convertToSnakeCase(_ stringKey: String) -> String {
             guard !stringKey.isEmpty else { return stringKey }
-        
+
             var words : [Range<String.Index>] = []
             // The general idea of this algorithm is to split words on transition from lower to upper case, then on transition of >1 upper case characters to lowercase
             //
@@ -121,12 +121,12 @@ open class JSONEncoder {
             // We assume, per Swift naming conventions, that the first character of the key is lowercase.
             var wordStart = stringKey.startIndex
             var searchRange = stringKey.index(after: wordStart)..<stringKey.endIndex
-        
+
             // Find next uppercase character
             while let upperCaseRange = stringKey.rangeOfCharacter(from: CharacterSet.uppercaseLetters, options: [], range: searchRange) {
                 let untilUpperCase = wordStart..<upperCaseRange.lowerBound
                 words.append(untilUpperCase)
-                
+
                 // Find next lowercase character
                 searchRange = upperCaseRange.lowerBound..<searchRange.upperBound
                 guard let lowerCaseRange = stringKey.rangeOfCharacter(from: CharacterSet.lowercaseLetters, options: [], range: searchRange) else {
@@ -134,7 +134,7 @@ open class JSONEncoder {
                     wordStart = searchRange.lowerBound
                     break
                 }
-                
+
                 // Is the next lowercase letter more than 1 after the uppercase? If so, we encountered a group of uppercase letters that we should treat as its own word
                 let nextCharacterAfterCapital = stringKey.index(after: upperCaseRange.lowerBound)
                 if lowerCaseRange.lowerBound == nextCharacterAfterCapital {
@@ -145,7 +145,7 @@ open class JSONEncoder {
                     // There was a range of >1 capital letters. Turn those into a word, stopping at the capital before the lower case character.
                     let beforeLowerIndex = stringKey.index(before: lowerCaseRange.lowerBound)
                     words.append(upperCaseRange.lowerBound..<beforeLowerIndex)
-                    
+
                     // Next word starts at the capital before the lowercase we just found
                     wordStart = beforeLowerIndex
                 }
@@ -173,7 +173,7 @@ open class JSONEncoder {
 
     /// The strategy to use for encoding keys. Defaults to `.useDefaultKeys`.
     open var keyEncodingStrategy: KeyEncodingStrategy = .useDefaultKeys
-    
+
     /// Contextual user-provided information for use during encoding.
     open var userInfo: [CodingUserInfoKey : Any] = [:]
 
@@ -212,28 +212,213 @@ open class JSONEncoder {
         let encoder = _JSONEncoder(options: self.options)
 
         guard let topLevel = try encoder.box_(value) else {
-            throw EncodingError.invalidValue(value, 
+            throw EncodingError.invalidValue(value,
                                              EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
         }
 
         if topLevel is NSNull {
-            throw EncodingError.invalidValue(value, 
+            throw EncodingError.invalidValue(value,
                                              EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) encoded as null JSON fragment."))
         } else if topLevel is NSNumber {
-            throw EncodingError.invalidValue(value, 
+            throw EncodingError.invalidValue(value,
                                              EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) encoded as number JSON fragment."))
         } else if topLevel is NSString {
-            throw EncodingError.invalidValue(value, 
+            throw EncodingError.invalidValue(value,
                                              EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) encoded as string JSON fragment."))
         }
 
         let writingOptions = JSONSerialization.WritingOptions(rawValue: self.outputFormatting.rawValue)
         do {
-           return try JSONSerialization.data(withJSONObject: topLevel, options: writingOptions)
+            return try JSONSerialization.data(withJSONObject: topLevel, options: writingOptions)
         } catch {
-            throw EncodingError.invalidValue(value, 
+            throw EncodingError.invalidValue(value,
                                              EncodingError.Context(codingPath: [], debugDescription: "Unable to encode the given top-level value to JSON.", underlyingError: error))
         }
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Structure Encoder
+//===----------------------------------------------------------------------===//
+
+/// `StructureEncoder` facilitates the encoding of `Encodable` values into Dictionary/Array/value structures.
+open class StructureEncoder {
+    // MARK: Options
+
+    /// The strategy to use for encoding `Date` values.
+    public enum DateEncodingStrategy {
+        /// Defer to `Date` for choosing an encoding. This is the default strategy.
+        case deferredToDate
+
+        /// Encode the `Date` as a UNIX timestamp (as a number).
+        case secondsSince1970
+
+        /// Encode the `Date` as UNIX millisecond timestamp (as a number).
+        case millisecondsSince1970
+
+        /// Encode the `Date` as an ISO-8601-formatted string (in RFC 3339 format).
+        @available(macOS 10.12, iOS 10.0, watchOS 3.0, tvOS 10.0, *)
+        case iso8601
+
+        /// Encode the `Date` as a string formatted by the given formatter.
+        case formatted(DateFormatter)
+
+        /// Encode the `Date` as a custom value encoded by the given closure.
+        ///
+        /// If the closure fails to encode a value into the given encoder, the encoder will encode an empty automatic container in its place.
+        case custom((Date, Encoder) throws -> Void)
+
+        fileprivate var JSONDateEncodingStrategy: JSONEncoder.DateEncodingStrategy {
+            switch self {
+            case .deferredToDate:
+                return .deferredToDate
+            case .secondsSince1970:
+                return .secondsSince1970
+            case .millisecondsSince1970:
+                return .millisecondsSince1970
+            case .iso8601:
+                if #available(macOS 10.12, iOS 10.0, watchOS 3.0, tvOS 10.0, *) {
+                    return .iso8601
+                } else {
+                    fatalError("This cannot be reached")
+                }
+            case .formatted(let dateFormatter):
+                return .formatted(dateFormatter)
+            case .custom(let customConversion):
+                return .custom(customConversion)
+            }
+        }
+    }
+
+    /// The strategy to use for encoding `Data` values.
+    public enum DataEncodingStrategy {
+        /// Defer to `Data` for choosing an encoding.
+        case deferredToData
+
+        /// Encoded the `Data` as a Base64-encoded string. This is the default strategy.
+        case base64
+
+        /// Encode the `Data` as a custom value encoded by the given closure.
+        ///
+        /// If the closure fails to encode a value into the given encoder, the encoder will encode an empty automatic container in its place.
+        case custom((Data, Encoder) throws -> Void)
+
+        fileprivate var JSONDataEncodingStrategy: JSONEncoder.DataEncodingStrategy {
+            switch self {
+            case .deferredToData:
+                return .deferredToData
+            case .base64:
+                return .base64
+            case .custom(let customConversion):
+                return .custom(customConversion)
+            }
+        }
+    }
+
+    /// The strategy to use for non-JSON-conforming floating-point values (IEEE 754 infinity and NaN).
+    public enum NonConformingFloatEncodingStrategy {
+        /// Throw upon encountering non-conforming values. This is the default strategy.
+        case `throw`
+
+        /// Encode the values using the given representation strings.
+        case convertToString(positiveInfinity: String, negativeInfinity: String, nan: String)
+
+        fileprivate var JSONNonConformingFloatEncodingStrategy: JSONEncoder.NonConformingFloatEncodingStrategy {
+            switch self {
+            case .throw:
+                return .throw
+            case .convertToString(let positiveInfinity, let negativeInfinity, let nan):
+                return .convertToString(positiveInfinity: positiveInfinity,
+                                        negativeInfinity: negativeInfinity,
+                                        nan: nan)
+            }
+        }
+    }
+
+    /// The strategy to use for automatically changing the value of keys before encoding.
+    public enum KeyEncodingStrategy {
+        /// Use the keys specified by each type. This is the default strategy.
+        case useDefaultKeys
+
+        /// Convert from "camelCaseKeys" to "snake_case_keys" before writing a key to structured representation.
+        ///
+        /// Capital characters are determined by testing membership in `CharacterSet.uppercaseLetters` and `CharacterSet.lowercaseLetters` (Unicode General Categories Lu and Lt).
+        /// The conversion to lower case uses `Locale.system`, also known as the ICU "root" locale. This means the result is consistent regardless of the current user's locale and language preferences.
+        ///
+        /// Converting from camel case to snake case:
+        /// 1. Splits words at the boundary of lower-case to upper-case
+        /// 2. Inserts `_` between words
+        /// 3. Lowercases the entire string
+        /// 4. Preserves starting and ending `_`.
+        ///
+        /// For example, `oneTwoThree` becomes `one_two_three`. `_oneTwoThree_` becomes `_one_two_three_`.
+        ///
+        /// - Note: Using a key encoding strategy has a nominal performance cost, as each string key has to be converted.
+        case convertToSnakeCase
+
+        /// Provide a custom conversion to the key in the encoded structure from the keys specified by the encoded types.
+        /// The full path to the current encoding position is provided for context (in case you need to locate this key within the payload). The returned key is used in place of the last component in the coding path before encoding.
+        /// If the result of the conversion is a duplicate key, then only one value will be present in the result.
+        case custom((_ codingPath: [CodingKey]) -> CodingKey)
+
+        fileprivate var JSONKeyEncodingStrategy: JSONEncoder.KeyEncodingStrategy {
+            switch self {
+            case .useDefaultKeys:
+                return .useDefaultKeys
+            case .convertToSnakeCase:
+                return .convertToSnakeCase
+            case .custom(let customConversion):
+                return .custom(customConversion)
+            }
+        }
+    }
+
+    /// The strategy to use in encoding dates. Defaults to `.deferredToDate`.
+    open var dateEncodingStrategy: DateEncodingStrategy = .deferredToDate
+
+    /// The strategy to use in encoding binary data. Defaults to `.base64`.
+    open var dataEncodingStrategy: DataEncodingStrategy = .base64
+
+    /// The strategy to use in encoding non-conforming numbers. Defaults to `.throw`.
+    open var nonConformingFloatEncodingStrategy: NonConformingFloatEncodingStrategy = .throw
+
+    /// The strategy to use for encoding keys. Defaults to `.useDefaultKeys`.
+    open var keyEncodingStrategy: KeyEncodingStrategy = .useDefaultKeys
+
+    /// Contextual user-provided information for use during encoding.
+    open var userInfo: [CodingUserInfoKey : Any] = [:]
+
+    /// The options set on the top-level encoder.
+    fileprivate var options: JSONEncoder._Options {
+        return JSONEncoder._Options(dateEncodingStrategy: dateEncodingStrategy.JSONDateEncodingStrategy,
+                                    dataEncodingStrategy: dataEncodingStrategy.JSONDataEncodingStrategy,
+                                    nonConformingFloatEncodingStrategy: nonConformingFloatEncodingStrategy.JSONNonConformingFloatEncodingStrategy,
+                                    keyEncodingStrategy: keyEncodingStrategy.JSONKeyEncodingStrategy,
+                                    userInfo: userInfo)
+    }
+
+    // MARK: - Constructing a Structure Encoder
+
+    /// Initializes `self` with default strategies.
+    public init() {}
+
+    // MARK: - Encoding Values
+
+    /// Encodes the given top-level value and returns its structural representation.
+    ///
+    /// - parameter value: The value to encode.
+    /// - returns: A new `Any` value containing the encoded structure.
+    /// - throws: `EncodingError.invalidValue` if a non-conforming floating-point value is encountered during encoding, and the encoding strategy is `.throw`.
+    /// - throws: An error if any value throws an error during encoding.
+    open func encode<T : Encodable>(_ value: T) throws -> Any {
+        let encoder = _JSONEncoder(options: self.options)
+
+        guard let topLevel = try encoder.box_(value) else {
+            throw EncodingError.invalidValue(value,
+                                             EncodingError.Context(codingPath: [], debugDescription: "Top-level \(T.self) did not encode any values."))
+        }
+
+        return topLevel
     }
 }
 
@@ -399,7 +584,7 @@ fileprivate struct _JSONKeyedEncodingContainer<K : CodingKey> : KeyedEncodingCon
             return converter(codingPath + [key])
         }
     }
-    
+
     // MARK: - KeyedEncodingContainerProtocol Methods
 
     public mutating func encodeNil(forKey key: Key) throws {
@@ -441,7 +626,7 @@ fileprivate struct _JSONKeyedEncodingContainer<K : CodingKey> : KeyedEncodingCon
     public mutating func encode(_ value: String, forKey key: Key) throws {
         self.container[_converted(key).stringValue] = self.encoder.box(value)
     }
-    
+
     public mutating func encode(_ value: Float, forKey key: Key) throws {
         // Since the float may be invalid and throw, the coding path needs to contain this key.
         self.encoder.codingPath.append(key)
@@ -688,7 +873,7 @@ extension _JSONEncoder {
             guard case let .convertToString(positiveInfinity: posInfString,
                                             negativeInfinity: negInfString,
                                             nan: nanString) = self.options.nonConformingFloatEncodingStrategy else {
-                throw EncodingError._invalidFloatingPointValue(float, at: codingPath)
+                                                throw EncodingError._invalidFloatingPointValue(float, at: codingPath)
             }
 
             if float == Float.infinity {
@@ -708,7 +893,7 @@ extension _JSONEncoder {
             guard case let .convertToString(positiveInfinity: posInfString,
                                             negativeInfinity: negInfString,
                                             nan: nanString) = self.options.nonConformingFloatEncodingStrategy else {
-                throw EncodingError._invalidFloatingPointValue(double, at: codingPath)
+                                                throw EncodingError._invalidFloatingPointValue(double, at: codingPath)
             }
 
             if double == Double.infinity {
@@ -921,7 +1106,7 @@ fileprivate class _JSONReferencingEncoder : _JSONEncoder {
         case 1: value = self.storage.popContainer()
         default: fatalError("Referencing encoder deallocated with multiple containers on stack.")
         }
-        
+
         switch self.reference {
         case .array(let array, let index):
             array.insert(value, at: index)
@@ -987,9 +1172,9 @@ open class JSONDecoder {
     public enum KeyDecodingStrategy {
         /// Use the keys specified by each type. This is the default strategy.
         case useDefaultKeys
-        
+
         /// Convert from "snake_case_keys" to "camelCaseKeys" before attempting to match a key with the one specified by each type.
-        /// 
+        ///
         /// The conversion to upper case uses `Locale.system`, also known as the ICU "root" locale. This means the result is consistent regardless of the current user's locale and language preferences.
         ///
         /// Converting from snake case to camel case:
@@ -1000,31 +1185,31 @@ open class JSONDecoder {
         ///
         /// - Note: Using a key decoding strategy has a nominal performance cost, as each string key has to be inspected for the `_` character.
         case convertFromSnakeCase
-        
+
         /// Provide a custom conversion from the key in the encoded JSON to the keys specified by the decoded types.
         /// The full path to the current decoding position is provided for context (in case you need to locate this key within the payload). The returned key is used in place of the last component in the coding path before decoding.
         /// If the result of the conversion is a duplicate key, then only one value will be present in the container for the type to decode from.
         case custom((_ codingPath: [CodingKey]) -> CodingKey)
-        
+
         fileprivate static func _convertFromSnakeCase(_ stringKey: String) -> String {
             guard !stringKey.isEmpty else { return stringKey }
-        
+
             // Find the first non-underscore character
             guard let firstNonUnderscore = stringKey.index(where: { $0 != "_" }) else {
                 // Reached the end without finding an _
                 return stringKey
             }
-        
+
             // Find the last non-underscore character
             var lastNonUnderscore = stringKey.index(before: stringKey.endIndex)
             while lastNonUnderscore > firstNonUnderscore && stringKey[lastNonUnderscore] == "_" {
                 stringKey.formIndex(before: &lastNonUnderscore)
             }
-        
+
             let keyRange = firstNonUnderscore...lastNonUnderscore
             let leadingUnderscoreRange = stringKey.startIndex..<firstNonUnderscore
             let trailingUnderscoreRange = stringKey.index(after: lastNonUnderscore)..<stringKey.endIndex
-        
+
             var components = stringKey[keyRange].split(separator: "_")
             let joinedString : String
             if components.count == 1 {
@@ -1033,7 +1218,7 @@ open class JSONDecoder {
             } else {
                 joinedString = ([components[0].lowercased()] + components[1...].map { $0.capitalized }).joined()
             }
-        
+
             // Do a cheap isEmpty check before creating and appending potentially empty strings
             let result : String
             if (leadingUnderscoreRange.isEmpty && trailingUnderscoreRange.isEmpty) {
@@ -1051,7 +1236,7 @@ open class JSONDecoder {
             return result
         }
     }
-    
+
     /// The strategy to use in decoding dates. Defaults to `.deferredToDate`.
     open var dateDecodingStrategy: DateDecodingStrategy = .deferredToDate
 
@@ -1063,7 +1248,7 @@ open class JSONDecoder {
 
     /// The strategy to use for decoding keys. Defaults to `.useDefaultKeys`.
     open var keyDecodingStrategy: KeyDecodingStrategy = .useDefaultKeys
-    
+
     /// Contextual user-provided information for use during decoding.
     open var userInfo: [CodingUserInfoKey : Any] = [:]
 
@@ -1102,13 +1287,189 @@ open class JSONDecoder {
     open func decode<T : Decodable>(_ type: T.Type, from data: Data) throws -> T {
         let topLevel: Any
         do {
-           topLevel = try JSONSerialization.jsonObject(with: data)
+            topLevel = try JSONSerialization.jsonObject(with: data)
         } catch {
             throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "The given data was not valid JSON.", underlyingError: error))
         }
 
         let decoder = _JSONDecoder(referencing: topLevel, options: self.options)
         guard let value = try decoder.unbox(topLevel, as: type) else {
+            throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: [], debugDescription: "The given data did not contain a top-level value."))
+        }
+
+        return value
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Structure Decoder
+//===----------------------------------------------------------------------===//
+
+/// `StructureDecoder` facilitates the decoding of `Dictionary`/`Array`/value structures into semantic `Decodable` types.
+open class StructureDecoder {
+    // MARK: Options
+
+    /// The strategy to use for decoding `Date` values.
+    public enum DateDecodingStrategy {
+        /// Defer to `Date` for decoding. This is the default strategy.
+        case deferredToDate
+
+        /// Decode the `Date` as a UNIX timestamp from a number in the structure.
+        case secondsSince1970
+
+        /// Decode the `Date` as UNIX millisecond timestamp from a number in the structure.
+        case millisecondsSince1970
+
+        /// Decode the `Date` as an ISO-8601-formatted string (in RFC 3339 format).
+        @available(macOS 10.12, iOS 10.0, watchOS 3.0, tvOS 10.0, *)
+        case iso8601
+
+        /// Decode the `Date` as a string parsed by the given formatter.
+        case formatted(DateFormatter)
+
+        /// Decode the `Date` as a custom value decoded by the given closure.
+        case custom((_ decoder: Decoder) throws -> Date)
+
+        fileprivate var JSONDateDecodingStrategy: JSONDecoder.DateDecodingStrategy {
+            switch self {
+            case .deferredToDate:
+                return .deferredToDate
+            case .secondsSince1970:
+                return .secondsSince1970
+            case .millisecondsSince1970:
+                return .millisecondsSince1970
+            case .iso8601:
+                if #available(macOS 10.12, iOS 10.0, watchOS 3.0, tvOS 10.0, *) {
+                    return .iso8601
+                } else {
+                    fatalError("This cannot be reached")
+                }
+            case .formatted(let formatter):
+                return .formatted(formatter)
+            case .custom(let customConversion):
+                return .custom(customConversion)
+            }
+        }
+    }
+
+    /// The strategy to use for decoding `Data` values.
+    public enum DataDecodingStrategy {
+        /// Defer to `Data` for decoding.
+        case deferredToData
+
+        /// Decode the `Data` from a Base64-encoded string. This is the default strategy.
+        case base64
+
+        /// Decode the `Data` as a custom value decoded by the given closure.
+        case custom((_ decoder: Decoder) throws -> Data)
+
+        fileprivate var JSONDataDecodingStrategy: JSONDecoder.DataDecodingStrategy {
+            switch self {
+            case .deferredToData:
+                return .deferredToData
+            case .base64:
+                return .base64
+            case .custom(let customConversion):
+                return .custom(customConversion)
+            }
+        }
+    }
+
+    /// The strategy to use for non-JSON-conforming floating-point values (IEEE 754 infinity and NaN).
+    public enum NonConformingFloatDecodingStrategy {
+        /// Throw upon encountering non-conforming values. This is the default strategy.
+        case `throw`
+
+        /// Decode the values from the given representation strings.
+        case convertFromString(positiveInfinity: String, negativeInfinity: String, nan: String)
+
+        fileprivate var JSONNonConformingFloatDecodingStrategy: JSONDecoder.NonConformingFloatDecodingStrategy {
+            switch self {
+            case .throw:
+                return .throw
+            case .convertFromString(let positiveInfinity, let negativeInfinity, let nan):
+                return .convertFromString(positiveInfinity: positiveInfinity, negativeInfinity: negativeInfinity, nan: nan)
+            }
+        }
+    }
+
+    /// The strategy to use for automatically changing the value of keys before decoding.
+    public enum KeyDecodingStrategy {
+        /// Use the keys specified by each type. This is the default strategy.
+        case useDefaultKeys
+
+        /// Convert from "snake_case_keys" to "camelCaseKeys" before attempting to match a key with the one specified by each type.
+        ///
+        /// The conversion to upper case uses `Locale.system`, also known as the ICU "root" locale. This means the result is consistent regardless of the current user's locale and language preferences.
+        ///
+        /// Converting from snake case to camel case:
+        /// 1. Capitalizes the word starting after each `_`
+        /// 2. Removes all `_`
+        /// 3. Preserves starting and ending `_` (as these are often used to indicate private variables or other metadata).
+        /// For example, `one_two_three` becomes `oneTwoThree`. `_one_two_three_` becomes `_oneTwoThree_`.
+        ///
+        /// - Note: Using a key decoding strategy has a nominal performance cost, as each string key has to be inspected for the `_` character.
+        case convertFromSnakeCase
+
+        /// Provide a custom conversion from the key in the encoded structure to the keys specified by the decoded types.
+        /// The full path to the current decoding position is provided for context (in case you need to locate this key within the payload). The returned key is used in place of the last component in the coding path before decoding.
+        /// If the result of the conversion is a duplicate key, then only one value will be present in the container for the type to decode from.
+        case custom((_ codingPath: [CodingKey]) -> CodingKey)
+
+        fileprivate var JSONKeyDecodingStrategy: JSONDecoder.KeyDecodingStrategy {
+            switch self {
+            case .useDefaultKeys:
+                return .useDefaultKeys
+            case .convertFromSnakeCase:
+                return .convertFromSnakeCase
+            case .custom(let customConversion):
+                return .custom(customConversion)
+            }
+        }
+    }
+
+    /// The strategy to use in decoding dates. Defaults to `.deferredToDate`.
+    open var dateDecodingStrategy: DateDecodingStrategy = .deferredToDate
+
+    /// The strategy to use in decoding binary data. Defaults to `.base64`.
+    open var dataDecodingStrategy: DataDecodingStrategy = .base64
+
+    /// The strategy to use in decoding non-conforming numbers. Defaults to `.throw`.
+    open var nonConformingFloatDecodingStrategy: NonConformingFloatDecodingStrategy = .throw
+
+    /// The strategy to use for decoding keys. Defaults to `.useDefaultKeys`.
+    open var keyDecodingStrategy: KeyDecodingStrategy = .useDefaultKeys
+
+    /// Contextual user-provided information for use during decoding.
+    open var userInfo: [CodingUserInfoKey : Any] = [:]
+
+    /// The options set on the top-level decoder.
+    fileprivate var options: JSONDecoder._Options {
+        return JSONDecoder._Options(dateDecodingStrategy: dateDecodingStrategy.JSONDateDecodingStrategy,
+                                    dataDecodingStrategy: dataDecodingStrategy.JSONDataDecodingStrategy,
+                                    nonConformingFloatDecodingStrategy: nonConformingFloatDecodingStrategy.JSONNonConformingFloatDecodingStrategy,
+                                    keyDecodingStrategy: keyDecodingStrategy.JSONKeyDecodingStrategy,
+                                    userInfo: userInfo)
+    }
+
+    // MARK: - Constructing a Structure Decoder
+
+    /// Initializes `self` with default strategies.
+    public init() {}
+
+    // MARK: - Decoding Values
+
+    /// Decodes a value of the given type from the given structural representation.
+    ///
+    /// - parameter type: The type of the value to decode.
+    /// - parameter data: The data to decode from.
+    /// - returns: A value of the requested type.
+    /// - throws: `DecodingError.dataCorrupted` if values requested from the payload are corrupted.
+    /// - throws: An error if any value throws an error during decoding.
+    open func decode<T : Decodable>(_ type: T.Type, from structure: Any) throws -> T {
+
+        let decoder = _JSONDecoder(referencing: structure, options: self.options)
+        guard let value = try decoder.unbox(structure, as: type) else {
             throw DecodingError.valueNotFound(type, DecodingError.Context(codingPath: [], debugDescription: "The given data did not contain a top-level value."))
         }
 
@@ -1280,7 +1641,7 @@ fileprivate struct _JSONKeyedDecodingContainer<K : CodingKey> : KeyedDecodingCon
             return "\(key) (\"\(key.stringValue)\")"
         }
     }
-    
+
     public func decodeNil(forKey key: Key) throws -> Bool {
         guard let entry = self.container[key.stringValue] else {
             throw DecodingError.keyNotFound(key, DecodingError.Context(codingPath: self.decoder.codingPath, debugDescription: "No value associated with key \(_errorDescription(of: key))."))
@@ -2025,10 +2386,10 @@ extension _JSONDecoder {
                 return false
             }
 
-        /* FIXME: If swift-corelibs-foundation doesn't change to use NSNumber, this code path will need to be included and tested:
-        } else if let bool = value as? Bool {
-            return bool
-        */
+            /* FIXME: If swift-corelibs-foundation doesn't change to use NSNumber, this code path will need to be included and tested:
+             } else if let bool = value as? Bool {
+             return bool
+             */
 
         }
 
@@ -2202,20 +2563,20 @@ extension _JSONDecoder {
 
             return Float(double)
 
-        /* FIXME: If swift-corelibs-foundation doesn't change to use NSNumber, this code path will need to be included and tested:
-        } else if let double = value as? Double {
-            if abs(double) <= Double(Float.max) {
-                return Float(double)
-            }
+            /* FIXME: If swift-corelibs-foundation doesn't change to use NSNumber, this code path will need to be included and tested:
+             } else if let double = value as? Double {
+             if abs(double) <= Double(Float.max) {
+             return Float(double)
+             }
 
-            overflow = true
-        } else if let int = value as? Int {
-            if let float = Float(exactly: int) {
-                return float
-            }
+             overflow = true
+             } else if let int = value as? Int {
+             if let float = Float(exactly: int) {
+             return float
+             }
 
-            overflow = true
-        */
+             overflow = true
+             */
 
         } else if let string = value as? String,
             case .convertFromString(let posInfString, let negInfString, let nanString) = self.options.nonConformingFloatDecodingStrategy {
@@ -2241,16 +2602,16 @@ extension _JSONDecoder {
             // * If it was Decimal, you will get back the nearest approximation
             return number.doubleValue
 
-        /* FIXME: If swift-corelibs-foundation doesn't change to use NSNumber, this code path will need to be included and tested:
-        } else if let double = value as? Double {
-            return double
-        } else if let int = value as? Int {
-            if let double = Double(exactly: int) {
-                return double
-            }
+            /* FIXME: If swift-corelibs-foundation doesn't change to use NSNumber, this code path will need to be included and tested:
+             } else if let double = value as? Double {
+             return double
+             } else if let int = value as? Int {
+             if let double = Double(exactly: int) {
+             return double
+             }
 
-            overflow = true
-        */
+             overflow = true
+             */
 
         } else if let string = value as? String,
             case .convertFromString(let posInfString, let negInfString, let nanString) = self.options.nonConformingFloatDecodingStrategy {
